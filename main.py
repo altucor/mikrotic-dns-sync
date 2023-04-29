@@ -1,6 +1,7 @@
 import sys
 import yaml
 import paramiko
+import argparse
 
 class DnsEntry:
     def __init__(self):
@@ -152,13 +153,42 @@ class DnsManager:
                         print(f'Adding missing entry from master to slave {router_first["router"].get_host()} => {router_second["router"].get_host()} :: {entry_first.to_command()}')
                         router_second["missing_dns_static"].append(entry_first)
 
+desc = """
+Simple python script which can sync DNS Static entries between several MikroTik\'s.\n
+Allows different sync modes like:\n
+    1) master - Where config from master deployed to all other slave routers.
+    2) exchange - Get DNS entries from all routers, analyze them to determine 
+        missing ones and synchronize them between all routers to fully identical 
+        lists by extending lists
+
+"""
+
+
 
 def main():
-    if len(sys.argv) != 2:
-        print("Error need to specify path to yaml config file")
-        return
+    sync_modes = [
+        "master",
+        "exchange"
+    ]
+
+    parser = argparse.ArgumentParser(
+                    prog='mikrotik-dns-sync',
+                    description=desc,
+                    epilog='ALTUCOR @ 2023')
+    parser.add_argument('--config', required=True, help="path to yaml config file")
+    parser.add_argument('--sync_mode', required=True, help="algorithm of detecting and exchanging of missing entries")
+    parser.add_argument('--show_diff', action="store_true", help="show calculated missing rules for each router, which can be applyied")
+    parser.add_argument('--apply_sync', action="store_true", help="apply calculated missing rules on the remote routers")
+    args = parser.parse_args()
+
+    if args.sync_mode is None:
+        parser.error("sync_mode argument is not set")
+
+    if args.sync_mode not in sync_modes:
+        parser.error("Unknown sync_mode")
+
     yaml_config = None
-    with open(sys.argv[1], "r") as stream:
+    with open(args.config, "r") as stream:
         try:
             yaml_config = yaml.safe_load(stream)
         except yaml.YAMLError as exc:
@@ -170,11 +200,14 @@ def main():
         if "master" in r:
             master = r["master"]
         manager.add_router(Mikrotik(r["host"], r["port"], r["username"], r["password"]), master)
-    # manager.sync_push_from_master()
-    manager.sync_exchange_all()
-    manager.get_missing_for_all_routers()
-    manager.apply_missing()
-    print("end app")
+    if args.sync_mode == "master":
+        manager.sync_push_from_master()
+    elif args.sync_mode == "exchange":
+        manager.sync_exchange_all()
+    if args.show_diff:
+        manager.get_missing_for_all_routers()
+    if args.apply_sync:
+        manager.apply_missing()
 
 if __name__ == "__main__":
     main()
