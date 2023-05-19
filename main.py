@@ -2,6 +2,7 @@ import sys
 import yaml
 import paramiko
 import argparse
+import logging
 
 class DnsEntry:
     def __init__(self):
@@ -38,19 +39,19 @@ class DnsEntry:
             cmd += f"{key}={self._body[key]} "
         return cmd
 
-    def dbg(self):
-        print(self.to_command())
-        # print(f"address={self._address} name={self._name} regexp={self._regexp} disabled={self._disabled}")
-
 
 class Mikrotik:
-    def __init__(self, host, port, username, password):
+    def __init__(self, logger, host, port, username, password):
+        self._logger = logger
         self._host = host
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self._logger.log(logging.INFO, f"[ Mikrotik ] Connecting to {self._host}")
         self._client.connect(host, port, username, password, look_for_keys=False)
+        self._logger.log(logging.INFO, f"[ Mikrotik ] Connected to {self._host}")
 
     def __del__(self):
+        self._logger.log(logging.INFO, f"[ Mikrotik ] Closing connection with {self._host}")
         self._client.close()
 
     def get_host(self):
@@ -63,6 +64,7 @@ class Mikrotik:
         return stdout.read().decode('utf-8')
 
     def get_dns_static(self):
+        self._logger.log(logging.INFO, f"[ Mikrotik ] getting DNS static entries from {self._host}")
         entries = []
         response = self.run_command("/ip dns static export")
         if response is None or response == "":
@@ -72,25 +74,30 @@ class Mikrotik:
                 continue
             entry = DnsEntry()
             entry.init_from_line(line)
-            # entry.dbg()
             entries.append(entry)
+        self._logger.log(logging.INFO, f"[ Mikrotik ] Got DNS static entries from {self._host}")
         return entries
 
     def add_dns_static_entry(self, dns_entry):
         # /ip dns static add name=test.test address=10.10.10.10
+        self._logger.log(logging.INFO, f"[ Mikrotik ] Adding DNS static entry to {self._host} :: {dns_entry.to_command()}")
         self.run_command(f"/ip dns static {dns_entry.to_command()}")
+        self._logger.log(logging.INFO, f"[ Mikrotik ] Add OK")
 
     def add_missing_entries(self, entries):
+        self._logger.log(logging.INFO, f"[ Mikrotik ] Adding DNS static entry list to {self._host}")
         for entry in entries:
             self.add_dns_static_entry(entry)
 
     def remove_dns_static_entry(self, index):
         # /ip dns static remove numbers=1
+        self._logger.log(logging.INFO, f"[ Mikrotik ] Removing DNS static entry from {self._host} :: index={index}")
         self.run_command(f"/ip dns static {index}")
 
 
 class DnsManager:
-    def __init__(self):
+    def __init__(self, logger):
+        self._logger = logger
         self._routers = []
 
     def add_router(self, router, master=False):
@@ -103,11 +110,11 @@ class DnsManager:
 
     def _get_missing_for_router(self, router):
         for entry in router["missing_dns_static"]:
-            print(f'Host {router["router"].get_host()} Missing entry :: {entry.to_command()}')
+            self._logger.log(logging.INFO, f'Host {router["router"].get_host()} Missing entry :: {entry.to_command()}')
 
     def get_missing_for_host(self, host):
         if host is None or host == "":
-            print("Empty host specified")
+            self._logger.log(logging.ERROR, "Empty host specified")
             return
         for r in self._routers:
             if r["router"].get_host() == host:
@@ -119,10 +126,9 @@ class DnsManager:
 
     def apply_missing(self):
         for r in self._routers:
-            print(f'Applying missing DNS Static entries for {r["router"].get_host()}')
+            self._logger.log(logging.INFO, f'Applying missing DNS Static entries for {r["router"].get_host()}')
             r["router"].add_missing_entries(r["missing_dns_static"])
-            print("Done")
-
+            self._logger.log(logging.INFO, "Done")
 
     def sync_push_from_master(self):
         master = None
@@ -140,7 +146,7 @@ class DnsManager:
             slave_config = r["dns_static"]
             for master_entry in master["dns_static"]:
                 if master_entry not in slave_config:
-                    print(f'Adding missing entry from master to slave {master["router"].get_host()} => {r["router"].get_host()} :: {master_entry.to_command()}')
+                    self._logger.log(logging.INFO, f'Adding missing entry from master to slave {master["router"].get_host()} => {r["router"].get_host()} :: {master_entry.to_command()}')
                     r["missing_dns_static"].append(master_entry)
 
     def sync_exchange_all(self):
@@ -150,7 +156,7 @@ class DnsManager:
                     if router_first["router"].get_host() == router_second["router"].get_host():
                         continue
                     if entry_first not in router_second["dns_static"]:
-                        print(f'Adding missing entry from master to slave {router_first["router"].get_host()} => {router_second["router"].get_host()} :: {entry_first.to_command()}')
+                        self._logger.log(logging.INFO, f'Adding missing entry from master to slave {router_first["router"].get_host()} => {router_second["router"].get_host()} :: {entry_first.to_command()}')
                         router_second["missing_dns_static"].append(entry_first)
 
 desc = """
@@ -163,9 +169,20 @@ Allows different sync modes like:\n
 
 """
 
-
+def get_logger():
+    logger = logging.getLogger("mikrotik-dns-sync")
+    logger.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt="%Y-%m-%d :: %H:%M:%S")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    return logger
 
 def main():
+    logger = get_logger()
+    logger.log(logging.INFO, "Start")
+
     sync_modes = [
         "master",
         "exchange"
@@ -192,14 +209,14 @@ def main():
         try:
             yaml_config = yaml.safe_load(stream)
         except yaml.YAMLError as exc:
-            print(exc)
+            logger.log(logging.CRITICAL, exc)
 
-    manager = DnsManager()
+    manager = DnsManager(logger)
     for key, r in yaml_config["routers"].items():
         master = False
         if "master" in r:
             master = r["master"]
-        manager.add_router(Mikrotik(r["host"], r["port"], r["username"], r["password"]), master)
+        manager.add_router(Mikrotik(logger, r["host"], r["port"], r["username"], r["password"]), master)
     if args.sync_mode == "master":
         manager.sync_push_from_master()
     elif args.sync_mode == "exchange":
@@ -208,6 +225,7 @@ def main():
         manager.get_missing_for_all_routers()
     if args.apply_sync:
         manager.apply_missing()
+    logger.log(logging.INFO, "Finish")
 
 if __name__ == "__main__":
     main()
