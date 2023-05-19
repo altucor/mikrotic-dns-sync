@@ -3,6 +3,7 @@ import yaml
 import paramiko
 import argparse
 import logging
+import binascii
 
 
 class DnsEntry:
@@ -20,6 +21,14 @@ class DnsEntry:
                 if self._body[key] != other._body[key]:
                     return False
         return True
+
+    def __hash__(self):
+        full_temp = ""
+        for key in self._keys:
+            if key not in self._body:
+                continue
+            full_temp += f"{key}{self._body[key]}"
+        return binascii.crc32(full_temp.encode("utf-8"))
 
     def init_from_line(self, line):
         # line - add address=10.0.0.1 name=gateway.localnet
@@ -112,92 +121,135 @@ class Mikrotik:
         self.run_command(f"/ip dns static {index}")
 
 
-class DnsManager:
-    def __init__(self, logger):
+class DnsDevice:
+    def __init__(self, device, master, logger):
         self._logger = logger
-        self._routers = []
+        self._device = device
+        self._master = master
+        self._dns_static = self._device.get_dns_static()
+        self._missing_dns_static = set()
 
-    def add_router(self, router, master=False):
-        obj = {}
-        obj["router"] = router
-        obj["master"] = master
-        obj["dns_static"] = router.get_dns_static()
-        obj["missing_dns_static"] = []
-        self._routers.append(obj)
+    def device(self):
+        return self._device
 
-    def _get_missing_for_router(self, router):
-        for entry in router["missing_dns_static"]:
+    def is_master(self):
+        return self._master
+
+    def dns_static(self):
+        return self._dns_static
+
+    def append_missing_dns_static(self, entry):
+        self._missing_dns_static.add(entry)
+
+    def is_entry_in_missing_list(self, entry):
+        return entry in self._missing_dns_static
+
+    def get_missing_dns_static(self):
+        return self._missing_dns_static
+
+    def print_missing_dns_static(self):
+        for entry in self._missing_dns_static:
             self._logger.log(
                 logging.INFO,
-                f'Host {router["router"].get_host()} Missing entry :: {entry.to_command()}',
+                f"Host {self._device.get_host()} Missing entry :: {entry.to_command()}",
             )
 
-    def get_missing_for_host(self, host):
-        if host is None or host == "":
-            self._logger.log(logging.ERROR, "Empty host specified")
-            return
-        for r in self._routers:
-            if r["router"].get_host() == host:
-                self._get_missing_for_router(r)
 
-    def get_missing_for_all_routers(self):
-        for r in self._routers:
-            self._get_missing_for_router(r)
+class Strategy:
+    def __init__(self, logger, dns_devices):
+        self._logger = logger
+        self._dns_devices = dns_devices
+        pass
 
-    def apply_missing(self):
-        for r in self._routers:
+    def analyze(self):
+        raise NotImplemented()
+
+    def apply(self):
+        for d in self._dns_devices:
             self._logger.log(
                 logging.INFO,
-                f'Applying missing DNS Static entries for {r["router"].get_host()}',
+                f"Applying missing DNS Static entries for {d.device().get_host()}",
             )
-            r["router"].add_missing_entries(r["missing_dns_static"])
+            d.device().add_missing_entries(d.get_missing_dns_static())
             self._logger.log(logging.INFO, "Done")
 
-    def sync_push_from_master(self):
+
+class Master(Strategy):
+    def analyze(self):
         master = None
-        for r in self._routers:
-            if r["master"]:
+        for d in self._dns_devices:
+            if d.is_master():
                 if master is not None:
                     raise Exception("Cannot have several masters")
-                master = r
+                master = d
         if master is None:
             raise Exception("Cannot find master router")
 
-        for r in self._routers:
-            if r["master"]:
+        self._logger.log(
+            logging.INFO, f"Found master router: {master.device().get_host()}"
+        )
+
+        for d in self._dns_devices:
+            if d.is_master():
                 continue
-            slave_config = r["dns_static"]
-            for master_entry in master["dns_static"]:
+            slave_config = d.dns_static()
+            for master_entry in master.dns_static():
                 if master_entry not in slave_config:
                     self._logger.log(
                         logging.INFO,
-                        f'Adding missing entry from master to slave {master["router"].get_host()} => {r["router"].get_host()} :: {master_entry.to_command()}',
+                        f"Adding missing entry from master to slave {master.device().get_host()} => {d.device().get_host()} :: {master_entry.to_command()}",
                     )
-                    r["missing_dns_static"].append(master_entry)
+                    d.append_missing_dns_static(master_entry)
 
-    def sync_exchange_all(self):
-        for router_first in self._routers:
-            for entry_first in router_first["dns_static"]:
-                for router_second in self._routers:
+
+class Exchange(Strategy):
+    def analyze(self):
+        for router_first in self._dns_devices:
+            for entry_first in router_first.dns_static():
+                for router_second in self._dns_devices:
                     if (
-                        router_first["router"].get_host()
-                        == router_second["router"].get_host()
+                        router_first.device().get_host()
+                        == router_second.device().get_host()
                     ):
                         continue
-                    if entry_first not in router_second["dns_static"]:
+                    if (
+                        entry_first not in router_second.dns_static()
+                        and not router_second.is_entry_in_missing_list(entry_first)
+                    ):
                         self._logger.log(
                             logging.INFO,
-                            f'Adding missing entry from master to slave {router_first["router"].get_host()} => {router_second["router"].get_host()} :: {entry_first.to_command()}',
+                            f"Missing entry from master to slave {router_first.device().get_host()} => {router_second.device().get_host()} :: {entry_first.to_command()}",
                         )
-                        router_second["missing_dns_static"].append(entry_first)
+                        router_second.append_missing_dns_static(entry_first)
 
-    # CEPH like scheme where who have more votes for decision
-    # will be trusted source of changes
-    def sync_authority(self):
-        for router_first in self._routers:
-            for entry_first in router_first["dns_static"]:
-                pass
-        pass
+
+class Authoritative(Strategy):
+    def analyze(self):
+        raise NotImplemented()
+
+
+class DnsManager:
+    def __init__(self, logger, strategy):
+        self._logger = logger
+        self._dns_devices = []
+        self._strategy = strategy(self._logger, self._dns_devices)
+
+    def analyze(self):
+        self._strategy.analyze()
+
+    def add_router(self, router, master=False):
+        d = DnsDevice(router, master, self._logger)
+        self._dns_devices.append(d)
+
+    def print_missing_for_all_routers(self):
+        self._logger.log(
+            logging.INFO, f"List of rules which should be executed after analysis"
+        )
+        for r in self._dns_devices:
+            r.print_missing_dns_static()
+
+    def apply_missing(self):
+        self._strategy.apply()
 
 
 desc = """
@@ -229,14 +281,14 @@ def main():
     logger = get_logger()
     logger.log(logging.INFO, "Start")
 
-    sync_modes = ["master", "exchange"]
+    strategies = ["master", "exchange"]
 
     parser = argparse.ArgumentParser(
         prog="mikrotik-dns-sync", description=desc, epilog="ALTUCOR @ 2023"
     )
     parser.add_argument("--config", required=True, help="path to yaml config file")
     parser.add_argument(
-        "--sync_mode",
+        "--strategy",
         required=True,
         help="algorithm of detecting and exchanging of missing entries",
     )
@@ -252,11 +304,11 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.sync_mode is None:
-        parser.error("sync_mode argument is not set")
+    if args.strategy is None:
+        parser.error("strategy argument is not set")
 
-    if args.sync_mode not in sync_modes:
-        parser.error("Unknown sync_mode")
+    if args.strategy not in strategies:
+        parser.error("Unknown strategy")
 
     yaml_config = None
     with open(args.config, "r") as stream:
@@ -265,7 +317,18 @@ def main():
         except yaml.YAMLError as exc:
             logger.log(logging.CRITICAL, exc)
 
-    manager = DnsManager(logger)
+    strategy = None
+    if args.strategy == "master":
+        strategy = Master
+    elif args.strategy == "exchange":
+        strategy = Exchange
+    elif args.strategy == "authoritative":
+        strategy = Authoritative
+
+    if strategy is None:
+        raise Exception("Error strategy is not set")
+
+    manager = DnsManager(logger, strategy)
     for key, r in yaml_config["routers"].items():
         master = False
         if "master" in r:
@@ -273,12 +336,9 @@ def main():
         manager.add_router(
             Mikrotik(logger, r["host"], r["port"], r["username"], r["password"]), master
         )
-    if args.sync_mode == "master":
-        manager.sync_push_from_master()
-    elif args.sync_mode == "exchange":
-        manager.sync_exchange_all()
+    manager.analyze()
     if args.show_diff:
-        manager.get_missing_for_all_routers()
+        manager.print_missing_for_all_routers()
     if args.apply_sync:
         manager.apply_missing()
     logger.log(logging.INFO, "Finish")
