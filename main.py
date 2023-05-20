@@ -159,7 +159,10 @@ class Strategy:
     def __init__(self, logger, dns_devices):
         self._logger = logger
         self._dns_devices = dns_devices
-        pass
+
+    @staticmethod
+    def name():
+        raise NotImplemented()
 
     def analyze(self):
         raise NotImplemented()
@@ -174,7 +177,11 @@ class Strategy:
             self._logger.log(logging.INFO, "Done")
 
 
-class Master(Strategy):
+class MasterPropagationOnlyNew(Strategy):
+    @staticmethod
+    def name():
+        return "master-propagation-only-new"
+
     def analyze(self):
         master = None
         for d in self._dns_devices:
@@ -202,7 +209,20 @@ class Master(Strategy):
                     d.append_missing_dns_static(master_entry)
 
 
+class MasterFullMirror(Strategy):
+    @staticmethod
+    def name():
+        return "master-full-mirror"
+
+    def analyze(self):
+        raise NotImplemented()
+
+
 class Exchange(Strategy):
+    @staticmethod
+    def name():
+        return "exchange"
+
     def analyze(self):
         for router_first in self._dns_devices:
             for entry_first in router_first.dns_static():
@@ -224,6 +244,10 @@ class Exchange(Strategy):
 
 
 class Authoritative(Strategy):
+    @staticmethod
+    def name():
+        return "authoritative"
+
     def analyze(self):
         raise NotImplemented()
 
@@ -281,8 +305,6 @@ def main():
     logger = get_logger()
     logger.log(logging.INFO, "Start")
 
-    strategies = ["master", "exchange"]
-
     parser = argparse.ArgumentParser(
         prog="mikrotik-dns-sync", description=desc, epilog="ALTUCOR @ 2023"
     )
@@ -307,7 +329,19 @@ def main():
     if args.strategy is None:
         parser.error("strategy argument is not set")
 
-    if args.strategy not in strategies:
+    strategies = [
+        MasterPropagationOnlyNew,
+        MasterFullMirror,
+        Exchange,
+        Authoritative,
+    ]
+
+    chosen_strategy = None
+    for s in strategies:
+        if args.strategy == s.name():
+            chosen_strategy = s
+
+    if chosen_strategy is None:
         parser.error("Unknown strategy")
 
     yaml_config = None
@@ -317,19 +351,8 @@ def main():
         except yaml.YAMLError as exc:
             logger.log(logging.CRITICAL, exc)
 
-    strategy = None
-    if args.strategy == "master":
-        strategy = Master
-    elif args.strategy == "exchange":
-        strategy = Exchange
-    elif args.strategy == "authoritative":
-        strategy = Authoritative
-
-    if strategy is None:
-        raise Exception("Error strategy is not set")
-
-    manager = DnsManager(logger, strategy)
-    for key, r in yaml_config["routers"].items():
+    manager = DnsManager(logger, chosen_strategy)
+    for _, r in yaml_config["routers"].items():
         master = False
         if "master" in r:
             master = r["master"]
