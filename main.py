@@ -2,6 +2,7 @@ import sys
 import yaml
 import paramiko
 import argparse
+from argparse import RawTextHelpFormatter
 import logging
 import binascii
 
@@ -68,6 +69,9 @@ class Mikrotik:
         )
         self._client.close()
 
+    def __eq__(self, other):
+        return self.get_host() == other.get_host()
+
     def get_host(self):
         return self._host
 
@@ -81,7 +85,7 @@ class Mikrotik:
         self._logger.log(
             logging.INFO, f"[ Mikrotik ] getting DNS static entries from {self._host}"
         )
-        entries = []
+        entries = set()
         response = self.run_command("/ip dns static export")
         if response is None or response == "":
             return entries
@@ -90,9 +94,10 @@ class Mikrotik:
                 continue
             entry = DnsEntry()
             entry.init_from_line(line)
-            entries.append(entry)
+            entries.add(entry)
         self._logger.log(
-            logging.INFO, f"[ Mikrotik ] Got DNS static entries from {self._host}"
+            logging.INFO,
+            f"[ Mikrotik ] Got {len(entries)} DNS static entries from {self._host}",
         )
         return entries
 
@@ -118,7 +123,7 @@ class Mikrotik:
             logging.INFO,
             f"[ Mikrotik ] Removing DNS static entry from {self._host} :: index={index}",
         )
-        self.run_command(f"/ip dns static {index}")
+        self.run_command(f"/ip dns static remove numbers={index}")
 
 
 class DnsDevice:
@@ -127,7 +132,7 @@ class DnsDevice:
         self._device = device
         self._master = master
         self._dns_static = self._device.get_dns_static()
-        self._missing_dns_static = set()
+        self._pending_updates = set()
 
     def device(self):
         return self._device
@@ -138,20 +143,23 @@ class DnsDevice:
     def dns_static(self):
         return self._dns_static
 
-    def append_missing_dns_static(self, entry):
-        self._missing_dns_static.add(entry)
+    def append_pending_updates(self, entry):
+        self._pending_updates.add(entry)
 
-    def is_entry_in_missing_list(self, entry):
-        return entry in self._missing_dns_static
+    def update_pending_updates(self, diff):
+        self._pending_updates.update(diff)
 
-    def get_missing_dns_static(self):
-        return self._missing_dns_static
+    def is_entry_in_pending_updates(self, entry):
+        return entry in self._pending_updates
 
-    def print_missing_dns_static(self):
-        for entry in self._missing_dns_static:
+    def get_pending_updates(self):
+        return self._pending_updates
+
+    def print_pending_updates(self):
+        for entry in self._pending_updates:
             self._logger.log(
                 logging.INFO,
-                f"Host {self._device.get_host()} Missing entry :: {entry.to_command()}",
+                f"Host {self._device.get_host()} Pending entry :: {entry.to_command()}",
             )
 
 
@@ -159,10 +167,17 @@ class Strategy:
     def __init__(self, logger, dns_devices):
         self._logger = logger
         self._dns_devices = dns_devices
-        pass
+
+    @staticmethod
+    def name() -> str:
+        raise NotImplementedError("Accessing abstract method of base class")
+
+    @staticmethod
+    def help() -> str:
+        raise NotImplementedError("Accessing abstract method of base class")
 
     def analyze(self):
-        raise NotImplemented()
+        raise NotImplementedError("Accessing abstract method of base class")
 
     def apply(self):
         for d in self._dns_devices:
@@ -170,21 +185,33 @@ class Strategy:
                 logging.INFO,
                 f"Applying missing DNS Static entries for {d.device().get_host()}",
             )
-            d.device().add_missing_entries(d.get_missing_dns_static())
+            d.device().add_missing_entries(d.get_pending_updates())
             self._logger.log(logging.INFO, "Done")
 
 
-class Master(Strategy):
-    def analyze(self):
-        master = None
-        for d in self._dns_devices:
-            if d.is_master():
-                if master is not None:
-                    raise Exception("Cannot have several masters")
-                master = d
-        if master is None:
-            raise Exception("Cannot find master router")
+def find_master(dns_devices):
+    master = None
+    for d in dns_devices:
+        if d.is_master():
+            if master is not None:
+                raise Exception("Cannot have several masters")
+            master = d
+    if master is None:
+        raise Exception("Cannot find master router")
+    return master
 
+
+class MasterPropagationOnlyNew(Strategy):
+    @staticmethod
+    def name():
+        return "master-propagation-only-new"
+
+    @staticmethod
+    def help() -> str:
+        return "Analyzes all routers and only spread new entries which is exist on master but missing specific slave"
+
+    def analyze(self):
+        master = find_master(self._dns_devices)
         self._logger.log(
             logging.INFO, f"Found master router: {master.device().get_host()}"
         )
@@ -192,40 +219,116 @@ class Master(Strategy):
         for d in self._dns_devices:
             if d.is_master():
                 continue
-            slave_config = d.dns_static()
-            for master_entry in master.dns_static():
-                if master_entry not in slave_config:
-                    self._logger.log(
-                        logging.INFO,
-                        f"Adding missing entry from master to slave {master.device().get_host()} => {d.device().get_host()} :: {master_entry.to_command()}",
-                    )
-                    d.append_missing_dns_static(master_entry)
+            diff = master.dns_static().difference(d.dns_static())
+            d.update_pending_updates(diff)
+
+
+class MasterFullMirror(Strategy):
+    @staticmethod
+    def name():
+        return "master-full-mirror"
+
+    @staticmethod
+    def help() -> str:
+        return "Adds and removes dns static entries on slaves to match master state"
+
+    def analyze(self):
+        master = find_master(self._dns_devices)
+        self._logger.log(
+            logging.INFO, f"Found master router: {master.device().get_host()}"
+        )
+
+        for d in self._dns_devices:
+            if d.is_master():
+                continue
+            diff = master.dns_static().difference(d.dns_static())
+            d.update_pending_updates(diff)
 
 
 class Exchange(Strategy):
+    @staticmethod
+    def name():
+        return "exchange"
+
+    @staticmethod
+    def help() -> str:
+        return """Ignores master markers. Analyzes all static entries on routers.
+        Does full exchange between routers by adding missing rules.
+        Hint: Good for situations when you randomly add entries on different routers and then want to deploy them on all routers."""
+
     def analyze(self):
         for router_first in self._dns_devices:
-            for entry_first in router_first.dns_static():
-                for router_second in self._dns_devices:
-                    if (
-                        router_first.device().get_host()
-                        == router_second.device().get_host()
-                    ):
-                        continue
-                    if (
-                        entry_first not in router_second.dns_static()
-                        and not router_second.is_entry_in_missing_list(entry_first)
-                    ):
-                        self._logger.log(
-                            logging.INFO,
-                            f"Missing entry from master to slave {router_first.device().get_host()} => {router_second.device().get_host()} :: {entry_first.to_command()}",
-                        )
-                        router_second.append_missing_dns_static(entry_first)
+            for router_second in self._dns_devices:
+                if (
+                    router_first.device().get_host()
+                    == router_second.device().get_host()
+                ):
+                    continue
+                diff = router_first.dns_static().difference(router_second.dns_static())
+                router_second.update_pending_updates(diff)
+
+                diff = router_second.dns_static().difference(router_first.dns_static())
+                router_first.update_pending_updates(diff)
+
+
+class VotedEntry:
+    def __init__(self, entry, total_voters, votes=1):
+        self._entry = entry
+        self._total_voters = total_voters
+        self._votes = votes
+
+    def __hash__(self):
+        return self._entry.__hash__()
+
+    def vote(self):
+        self._votes += 1
+
+    def get_entry(self):
+        return self._entry
+
+    def get_percent(self):
+        return round(self._votes * 100 / self._total_voters, 2)
+
+    def get_info(self):
+        return f"{self.get_percent()}% Votes for validity of {self._entry.to_command()}"
 
 
 class Authoritative(Strategy):
+    @staticmethod
+    def name():
+        return "authoritative"
+
+    @staticmethod
+    def help() -> str:
+        return "By voting all routers decides who giving truth about actual state"
+
+    def _collect_votes(self):
+        voted_entries = dict()
+        total_voters = len(self._dns_devices)
+        for d in self._dns_devices:
+            for dns_record in d.dns_static():
+                if dns_record.__hash__() in voted_entries:
+                    voted_entries[dns_record.__hash__()].vote()
+                else:
+                    voted_entries[dns_record.__hash__()] = VotedEntry(
+                        dns_record, total_voters
+                    )
+        return voted_entries
+
     def analyze(self):
-        raise NotImplemented()
+        voted_entries = self._collect_votes()
+        for key in voted_entries:
+            if voted_entries[key].get_percent() == 100:
+                continue
+            prefix = "[ AUTHORITATIVE DECLINED ]"
+            voted_entries[key].get_info()
+            if voted_entries[key].get_percent() >= 50:
+                prefix = "[ AUTHORITATIVE APPROVED ]"
+                entry = voted_entries[key].get_entry()
+                for d in self._dns_devices:
+                    if entry not in d.dns_static():
+                        d.append_pending_updates(voted_entries[key].get_entry())
+            self._logger.log(logging.INFO, f"{prefix} {voted_entries[key].get_info()}")
 
 
 class DnsManager:
@@ -241,14 +344,14 @@ class DnsManager:
         d = DnsDevice(router, master, self._logger)
         self._dns_devices.append(d)
 
-    def print_missing_for_all_routers(self):
+    def print_pending_for_all_routers(self):
         self._logger.log(
             logging.INFO, f"List of rules which should be executed after analysis"
         )
         for r in self._dns_devices:
-            r.print_missing_dns_static()
+            r.print_pending_updates()
 
-    def apply_missing(self):
+    def apply_pending(self):
         self._strategy.apply()
 
 
@@ -281,16 +384,30 @@ def main():
     logger = get_logger()
     logger.log(logging.INFO, "Start")
 
-    strategies = ["master", "exchange"]
+    strategies = [
+        MasterPropagationOnlyNew,
+        MasterFullMirror,
+        Exchange,
+        Authoritative,
+    ]
 
+    strategy_help = ""
+    for s in strategies:
+        strategy_help += f"* {s.name()} - {s.help()}\n"
+
+    # parser = ArgumentParser(description='test', formatter_class=RawTextHelpFormatter)
     parser = argparse.ArgumentParser(
-        prog="mikrotik-dns-sync", description=desc, epilog="ALTUCOR @ 2023"
+        prog="mikrotik-dns-sync",
+        description=desc,
+        epilog="ALTUCOR @ 2023",
+        formatter_class=RawTextHelpFormatter,
     )
     parser.add_argument("--config", required=True, help="path to yaml config file")
     parser.add_argument(
         "--strategy",
         required=True,
-        help="algorithm of detecting and exchanging of missing entries",
+        help="algorithm of detecting and exchanging of missing entries.\n"
+        + strategy_help,
     )
     parser.add_argument(
         "--show_diff",
@@ -298,16 +415,28 @@ def main():
         help="show calculated missing rules for each router, which can be applyied",
     )
     parser.add_argument(
-        "--apply_sync",
+        "--apply_pending",
         action="store_true",
-        help="apply calculated missing rules on the remote routers",
+        help="apply calculated pending rules on the remote routers",
     )
     args = parser.parse_args()
 
     if args.strategy is None:
         parser.error("strategy argument is not set")
 
-    if args.strategy not in strategies:
+    strategies = [
+        MasterPropagationOnlyNew,
+        MasterFullMirror,
+        Exchange,
+        Authoritative,
+    ]
+
+    chosen_strategy = None
+    for s in strategies:
+        if args.strategy == s.name():
+            chosen_strategy = s
+
+    if chosen_strategy is None:
         parser.error("Unknown strategy")
 
     yaml_config = None
@@ -317,19 +446,8 @@ def main():
         except yaml.YAMLError as exc:
             logger.log(logging.CRITICAL, exc)
 
-    strategy = None
-    if args.strategy == "master":
-        strategy = Master
-    elif args.strategy == "exchange":
-        strategy = Exchange
-    elif args.strategy == "authoritative":
-        strategy = Authoritative
-
-    if strategy is None:
-        raise Exception("Error strategy is not set")
-
-    manager = DnsManager(logger, strategy)
-    for key, r in yaml_config["routers"].items():
+    manager = DnsManager(logger, chosen_strategy)
+    for _, r in yaml_config["routers"].items():
         master = False
         if "master" in r:
             master = r["master"]
@@ -338,9 +456,9 @@ def main():
         )
     manager.analyze()
     if args.show_diff:
-        manager.print_missing_for_all_routers()
-    if args.apply_sync:
-        manager.apply_missing()
+        manager.print_pending_for_all_routers()
+    if args.apply_pending:
+        manager.apply_pending()
     logger.log(logging.INFO, "Finish")
 
 
