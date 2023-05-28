@@ -30,7 +30,7 @@ class DnsManager:
             logging.INFO, f"List of rules which should be executed after analysis"
         )
         for r in self._dns_devices:
-            r.print_pending_updates()
+            r.print_pending_changes()
 
     def apply_pending(self):
         self._strategy.apply()

@@ -1,52 +1,6 @@
 import paramiko
 import logging
-import binascii
-
-
-class DnsEntry:
-    def __init__(self):
-        self._keys = ["address", "name", "regexp", "disabled"]
-        self._body = {}
-
-    def __eq__(self, other):
-        for key in self._keys:
-            if (key in self._body and key not in other._body) or (
-                key not in self._body and key in other._body
-            ):
-                return False
-            if key in self._body and key in other._body:
-                if self._body[key] != other._body[key]:
-                    return False
-        return True
-
-    def __hash__(self):
-        full_temp = ""
-        for key in self._keys:
-            if key not in self._body:
-                continue
-            full_temp += f"{key}{self._body[key]}"
-        return binascii.crc32(full_temp.encode("utf-8"))
-
-    def init_from_line(self, line):
-        # line - add address=10.0.0.1 name=gateway.localnet
-        # part - address=10.0.0.1
-        for part in line.split(" "):
-            if "=" not in part:
-                continue
-            kv = part.split("=")
-            # kv = key value
-            for key in self._keys:
-                if kv[0] == key:
-                    self._body[key] = kv[1]
-                    break
-
-    def to_command(self):
-        cmd = "add "
-        for key in self._keys:
-            if key not in self._body:
-                continue
-            cmd += f"{key}={self._body[key]} "
-        return cmd
+from dns_entry import DnsEntry
 
 
 class Mikrotik:
@@ -71,18 +25,19 @@ class Mikrotik:
     def get_host(self):
         return self._host
 
-    def run_command(self, cmd):
+    def run_command_str(self, cmd):
         stdin, stdout, stderr = self._client.exec_command(cmd)
         if stdout.channel.recv_exit_status() != 0:
-            raise Exception("Error running command")
+            error_text = stdout.read().decode("utf-8")
+            raise Exception(f"Error running command: {error_text}")
         return stdout.read().decode("utf-8")
 
     def get_dns_static(self):
         self._logger.log(
             logging.INFO, f"[ Mikrotik ] getting DNS static entries from {self._host}"
         )
-        entries = set()
-        response = self.run_command("/ip dns static export")
+        entries = list()
+        response = self.run_command_str("/ip dns static export")
         if response is None or response == "":
             return entries
         for line in response.split("\r\n"):
@@ -90,20 +45,20 @@ class Mikrotik:
                 continue
             entry = DnsEntry()
             entry.init_from_line(line)
-            entries.add(entry)
+            entries.append(entry)
         self._logger.log(
             logging.INFO,
             f"[ Mikrotik ] Got {len(entries)} DNS static entries from {self._host}",
         )
         return entries
 
-    def add_dns_static_entry(self, dns_entry):
+    def add_dns_static_entry(self, dns_entry: DnsEntry):
         # /ip dns static add name=test.test address=10.10.10.10
         self._logger.log(
             logging.INFO,
             f"[ Mikrotik ] Adding DNS static entry to {self._host} :: {dns_entry.to_command()}",
         )
-        self.run_command(f"/ip dns static {dns_entry.to_command()}")
+        self.run_command_str(f"/ip dns static add {dns_entry.to_command()}")
         self._logger.log(logging.INFO, f"[ Mikrotik ] Add OK")
 
     def add_missing_entries(self, entries):
@@ -113,13 +68,28 @@ class Mikrotik:
         for entry in entries:
             self.add_dns_static_entry(entry)
 
-    def remove_dns_static_entry(self, index):
-        # /ip dns static remove numbers=1
+    def remove_dns_static_entries(self, indexes):
+        # /ip dns static remove numbers=1,2,3
+        indexes_cmd_part = "".join("{:d},".format(i) for i in indexes)[:-1]
         self._logger.log(
             logging.INFO,
-            f"[ Mikrotik ] Removing DNS static entry from {self._host} :: index={index}",
+            f"[ Mikrotik ] Removing DNS static entry from {self._host} :: indexes={indexes_cmd_part}",
         )
-        self.run_command(f"/ip dns static remove numbers={index}")
+        self.run_command_str(f"/ip dns static remove numbers={indexes_cmd_part}")
+
+    def find_and_remove_static_entries(self, entries):
+        static = self.get_dns_static()
+        indexes = []
+        for item in entries:
+            indexes.append(static.index(item))
+        if len(indexes) == 0:
+            return
+        for i in indexes:
+            self._logger.log(
+                logging.INFO,
+                f"[ Mikrotik ] Removing DNS static entry from {self._host} :: {i} = {static[i].to_command()}",
+            )
+        self.remove_dns_static_entries(indexes)
 
 
 class DnsDevice:
@@ -127,8 +97,9 @@ class DnsDevice:
         self._logger = logger
         self._device = device
         self._master = master
-        self._dns_static = self._device.get_dns_static()
-        self._pending_updates = set()
+        self._dns_static = set(self._device.get_dns_static())
+        self.pending_add = set()
+        self.pending_del = set()
 
     def device(self):
         return self._device
@@ -139,21 +110,14 @@ class DnsDevice:
     def dns_static(self):
         return self._dns_static
 
-    def append_pending_updates(self, entry):
-        self._pending_updates.add(entry)
-
-    def update_pending_updates(self, diff):
-        self._pending_updates.update(diff)
-
-    def is_entry_in_pending_updates(self, entry):
-        return entry in self._pending_updates
-
-    def get_pending_updates(self):
-        return self._pending_updates
-
-    def print_pending_updates(self):
-        for entry in self._pending_updates:
+    def print_pending_changes(self):
+        for entry in self.pending_add:
             self._logger.log(
                 logging.INFO,
-                f"Host {self._device.get_host()} Pending entry :: {entry.to_command()}",
+                f"Host {self._device.get_host()} Pending ADD entry :: {entry.to_command()}",
+            )
+        for entry in self.pending_del:
+            self._logger.log(
+                logging.INFO,
+                f"Host {self._device.get_host()} Pending DEL entry :: {entry.to_command()}",
             )

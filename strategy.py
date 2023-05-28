@@ -21,10 +21,11 @@ class Strategy:
         for d in self._dns_devices:
             self._logger.log(
                 logging.INFO,
-                f"Applying missing DNS Static entries for {d.device().get_host()}",
+                f"Applying pending DNS Static entries for {d.device().get_host()}",
             )
-            d.device().add_missing_entries(d.get_pending_updates())
-            self._logger.log(logging.INFO, "Done")
+            d.device().find_and_remove_static_entries(d.pending_del)
+            d.device().add_missing_entries(d.pending_add)
+            self._logger.log(logging.INFO, "Strategy Apply Done")
 
 
 def find_master(dns_devices):
@@ -58,7 +59,7 @@ class MasterPropagationOnlyNew(Strategy):
             if d.is_master():
                 continue
             diff = master.dns_static().difference(d.dns_static())
-            d.update_pending_updates(diff)
+            d.pending_add.update(diff)
 
 
 class MasterFullMirror(Strategy):
@@ -80,7 +81,12 @@ class MasterFullMirror(Strategy):
             if d.is_master():
                 continue
             diff = master.dns_static().difference(d.dns_static())
-            d.update_pending_updates(diff)
+            d.pending_add.update(diff)
+
+            remove_diff = d.dns_static().difference(master.dns_static())
+            for item in remove_diff:
+                print(item.to_command())
+            d.pending_del.update(remove_diff)
 
 
 class Exchange(Strategy):
@@ -103,10 +109,10 @@ class Exchange(Strategy):
                 ):
                     continue
                 diff = router_first.dns_static().difference(router_second.dns_static())
-                router_second.update_pending_updates(diff)
+                router_second.pending_add.update(diff)
 
                 diff = router_second.dns_static().difference(router_first.dns_static())
-                router_first.update_pending_updates(diff)
+                router_first.pending_add.update(diff)
 
 
 class VotedEntry:
@@ -165,5 +171,5 @@ class Authoritative(Strategy):
                 entry = voted_entries[key].get_entry()
                 for d in self._dns_devices:
                     if entry not in d.dns_static():
-                        d.append_pending_updates(voted_entries[key].get_entry())
+                        d.pending_add.add(voted_entries[key].get_entry())
             self._logger.log(logging.INFO, f"{prefix} {voted_entries[key].get_info()}")
