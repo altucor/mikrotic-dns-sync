@@ -10,7 +10,7 @@ class Mikrotik:
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self._logger.log(logging.INFO, f"[ Mikrotik ] Connecting to {self._host}")
-        self._client.connect(host, port, username, password, look_for_keys=False)
+        self._client.connect(host, port, username, password, look_for_keys=False, allow_agent=False)
         self._logger.log(logging.INFO, f"[ Mikrotik ] Connected to {self._host}")
 
     def __del__(self):
